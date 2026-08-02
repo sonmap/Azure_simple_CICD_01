@@ -185,10 +185,6 @@ stages:
                 if [ -n "${servicePrincipalKey:-}" ]; then export ARM_CLIENT_SECRET="$servicePrincipalKey"; fi
                 if [ -n "${idToken:-}" ]; then export ARM_USE_OIDC=true; export ARM_OIDC_TOKEN="$idToken"; fi
 
-                ssh-keygen -q -t rsa -b 4096 -f "$(Agent.TempDirectory)/id_rsa" -N ''
-                export TF_VAR_admin_ssh_public_key
-                TF_VAR_admin_ssh_public_key="$(cat "$(Agent.TempDirectory)/id_rsa.pub")"
-
                 terraform -chdir=20-vm init -input=false \
                   -backend-config="resource_group_name=$(stateResourceGroup)" \
                   -backend-config="storage_account_name=$(stateStorageAccount)" \
