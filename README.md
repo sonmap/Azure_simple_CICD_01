@@ -89,7 +89,9 @@ CI_Validate
 
 00단계는 첫 실행에서 local state로 Storage Account와 Container를 만든 후 `00-state.tfstate`를 새 remote backend로 자동 이전합니다. 두 번째 실행부터는 remote state를 직접 사용합니다.
 
-20단계에서는 파이프라인 실행 중 임시 SSH 키를 생성합니다. VM은 SSH를 외부에 노출하지 않으며, Nginx 설치는 30단계의 Azure VM Extension으로 수행합니다.
+20단계는 `20-vm/no-login.pub`의 고정 공개키를 사용하므로 파이프라인을 다시 실행해도 SSH 키 변경 때문에 VM이 교체되지 않습니다. 이 키의 개인키는 저장하지 않으며 VM의 SSH 포트도 외부에 열지 않습니다. 실제 관리 접속이 필요하면 자신의 공개키와 Azure Bastion 또는 사설 관리 경로를 사용해야 합니다.
+
+Nginx 설치는 30단계의 Azure VM Extension으로 수행합니다.
 
 ## 접속 확인
 
