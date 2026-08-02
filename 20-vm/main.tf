@@ -1,0 +1,129 @@
+terraform {
+  required_version = ">= 1.10.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 4.81"
+    }
+  }
+
+  backend "azurerm" {}
+}
+
+provider "azurerm" {
+  features {}
+}
+
+variable "prefix" {
+  description = "Resource name prefix."
+  type        = string
+  default     = "simplecicd"
+}
+
+variable "state_resource_group_name" {
+  type = string
+}
+
+variable "state_storage_account_name" {
+  type = string
+}
+
+variable "state_container_name" {
+  type = string
+}
+
+variable "admin_username" {
+  description = "Linux VM administrator name."
+  type        = string
+  default     = "azureuser"
+}
+
+variable "vm_size" {
+  description = "Small VM size for the sample."
+  type        = string
+  default     = "Standard_B1s"
+}
+
+data "terraform_remote_state" "network" {
+  backend = "azurerm"
+
+  config = {
+    resource_group_name  = var.state_resource_group_name
+    storage_account_name = var.state_storage_account_name
+    container_name       = var.state_container_name
+    key                  = "10-network.tfstate"
+  }
+}
+
+resource "azurerm_network_interface" "web" {
+  name                = "nic-${var.prefix}-vm01"
+  location            = data.terraform_remote_state.network.outputs.location
+  resource_group_name = data.terraform_remote_state.network.outputs.resource_group_name
+
+  ip_configuration {
+    name                          = "ipconfig1"
+    subnet_id                     = data.terraform_remote_state.network.outputs.subnet_id
+    private_ip_address_allocation = "Dynamic"
+  }
+
+  tags = {
+    project = "azure-simple-cicd-01"
+  }
+}
+
+resource "azurerm_network_interface_backend_address_pool_association" "web" {
+  network_interface_id    = azurerm_network_interface.web.id
+  ip_configuration_name   = "ipconfig1"
+  backend_address_pool_id = data.terraform_remote_state.network.outputs.lb_backend_pool_id
+}
+
+resource "azurerm_linux_virtual_machine" "web" {
+  name                            = "vm-${var.prefix}-01"
+  location                        = data.terraform_remote_state.network.outputs.location
+  resource_group_name             = data.terraform_remote_state.network.outputs.resource_group_name
+  size                            = var.vm_size
+  admin_username                  = var.admin_username
+  disable_password_authentication = true
+  network_interface_ids           = [azurerm_network_interface.web.id]
+
+  admin_ssh_key {
+    username   = var.admin_username
+    public_key = file("${path.module}/no-login.pub")
+  }
+
+  os_disk {
+    name                 = "osdisk-${var.prefix}-vm01"
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+    disk_size_gb         = 30
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts"
+    version   = "latest"
+  }
+
+  tags = {
+    project = "azure-simple-cicd-01"
+    role    = "nginx-web"
+  }
+}
+
+output "vm_id" {
+  value = azurerm_linux_virtual_machine.web.id
+}
+
+output "vm_name" {
+  value = azurerm_linux_virtual_machine.web.name
+}
+
+output "vm_private_ip" {
+  value = azurerm_network_interface.web.private_ip_address
+}
+
+output "lb_public_ip" {
+  value = data.terraform_remote_state.network.outputs.lb_public_ip
+}

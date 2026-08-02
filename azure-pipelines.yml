@@ -1,0 +1,242 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+parameters:
+  - name: deploy
+    displayName: Deploy Azure resources
+    type: boolean
+    default: false
+
+variables:
+  azureServiceConnection: 'sc-azure-simple-cicd'
+  terraformVersion: '1.15.8'
+  location: 'koreacentral'
+  prefix: 'simplecicd'
+  stateResourceGroup: 'rg-simplecicd-tfstate-krc'
+  stateStorageAccount: 'tfstatesonmapcicd01'
+  stateContainer: 'tfstate'
+
+stages:
+  - stage: CI_Validate
+    displayName: 'CI - Terraform Validate'
+    jobs:
+      - job: Validate
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              curl -fsSLo terraform.zip "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip"
+              unzip -o terraform.zip
+              sudo install terraform /usr/local/bin/terraform
+              terraform version
+            displayName: 'Install Terraform'
+
+          - bash: |
+              set -euo pipefail
+              terraform fmt -check -recursive
+
+              for dir in 00-state 10-network 20-vm 30-nginx; do
+                echo "Validating ${dir}"
+                terraform -chdir="${dir}" init -backend=false -input=false
+                terraform -chdir="${dir}" validate
+              done
+            displayName: 'Format and validate'
+
+  - stage: CD_00_State
+    displayName: '00 - Terraform State Storage'
+    dependsOn: CI_Validate
+    condition: and(succeeded(), eq(${{ parameters.deploy }}, true), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: StateStorage
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - task: AzureCLI@3
+            displayName: 'Create or update remote state storage'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                curl -fsSLo terraform.zip "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip"
+                unzip -o terraform.zip
+                sudo install terraform /usr/local/bin/terraform
+
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_CLIENT_ID="$servicePrincipalId"
+
+                if [ -n "${servicePrincipalKey:-}" ]; then
+                  export ARM_CLIENT_SECRET="$servicePrincipalKey"
+                elif [ -n "${idToken:-}" ]; then
+                  export ARM_USE_OIDC=true
+                  export ARM_OIDC_TOKEN="$idToken"
+                fi
+
+                cd 00-state
+                rm -f backend.tf
+
+                if az storage account show \
+                  --resource-group "$(stateResourceGroup)" \
+                  --name "$(stateStorageAccount)" >/dev/null 2>&1; then
+                  cp backend.azurerm.tf.template backend.tf
+                  terraform init -input=false \
+                    -backend-config="resource_group_name=$(stateResourceGroup)" \
+                    -backend-config="storage_account_name=$(stateStorageAccount)" \
+                    -backend-config="container_name=$(stateContainer)" \
+                    -backend-config="key=00-state.tfstate"
+                else
+                  terraform init -input=false
+                fi
+
+                terraform apply -auto-approve -input=false \
+                  -var="location=$(location)" \
+                  -var="state_resource_group_name=$(stateResourceGroup)" \
+                  -var="state_storage_account_name=$(stateStorageAccount)" \
+                  -var="state_container_name=$(stateContainer)"
+
+                if [ ! -f backend.tf ]; then
+                  cp backend.azurerm.tf.template backend.tf
+                  terraform init -migrate-state -force-copy -input=false \
+                    -backend-config="resource_group_name=$(stateResourceGroup)" \
+                    -backend-config="storage_account_name=$(stateStorageAccount)" \
+                    -backend-config="container_name=$(stateContainer)" \
+                    -backend-config="key=00-state.tfstate"
+                fi
+
+  - stage: CD_10_Network
+    displayName: '10 - Network and Load Balancer'
+    dependsOn: CD_00_State
+    condition: succeeded()
+    jobs:
+      - job: Network
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - task: AzureCLI@3
+            displayName: 'Deploy VNet, NSG and Public Load Balancer'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                curl -fsSLo terraform.zip "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip"
+                unzip -o terraform.zip
+                sudo install terraform /usr/local/bin/terraform
+
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                if [ -n "${servicePrincipalKey:-}" ]; then export ARM_CLIENT_SECRET="$servicePrincipalKey"; fi
+                if [ -n "${idToken:-}" ]; then export ARM_USE_OIDC=true; export ARM_OIDC_TOKEN="$idToken"; fi
+
+                terraform -chdir=10-network init -input=false \
+                  -backend-config="resource_group_name=$(stateResourceGroup)" \
+                  -backend-config="storage_account_name=$(stateStorageAccount)" \
+                  -backend-config="container_name=$(stateContainer)" \
+                  -backend-config="key=10-network.tfstate"
+
+                terraform -chdir=10-network apply -auto-approve -input=false \
+                  -var="prefix=$(prefix)" \
+                  -var="location=$(location)"
+
+  - stage: CD_20_VM
+    displayName: '20 - Linux VM'
+    dependsOn: CD_10_Network
+    condition: succeeded()
+    jobs:
+      - job: VM
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - task: AzureCLI@3
+            displayName: 'Deploy Linux VM and attach it to the LB pool'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                curl -fsSLo terraform.zip "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip"
+                unzip -o terraform.zip
+                sudo install terraform /usr/local/bin/terraform
+
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                if [ -n "${servicePrincipalKey:-}" ]; then export ARM_CLIENT_SECRET="$servicePrincipalKey"; fi
+                if [ -n "${idToken:-}" ]; then export ARM_USE_OIDC=true; export ARM_OIDC_TOKEN="$idToken"; fi
+
+                terraform -chdir=20-vm init -input=false \
+                  -backend-config="resource_group_name=$(stateResourceGroup)" \
+                  -backend-config="storage_account_name=$(stateStorageAccount)" \
+                  -backend-config="container_name=$(stateContainer)" \
+                  -backend-config="key=20-vm.tfstate"
+
+                terraform -chdir=20-vm apply -auto-approve -input=false \
+                  -var="prefix=$(prefix)" \
+                  -var="state_resource_group_name=$(stateResourceGroup)" \
+                  -var="state_storage_account_name=$(stateStorageAccount)" \
+                  -var="state_container_name=$(stateContainer)"
+
+  - stage: CD_30_Nginx
+    displayName: '30 - Nginx Web Service'
+    dependsOn: CD_20_VM
+    condition: succeeded()
+    jobs:
+      - job: Nginx
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - task: AzureCLI@3
+            displayName: 'Install Nginx with VM Custom Script Extension'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                curl -fsSLo terraform.zip "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip"
+                unzip -o terraform.zip
+                sudo install terraform /usr/local/bin/terraform
+
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                if [ -n "${servicePrincipalKey:-}" ]; then export ARM_CLIENT_SECRET="$servicePrincipalKey"; fi
+                if [ -n "${idToken:-}" ]; then export ARM_USE_OIDC=true; export ARM_OIDC_TOKEN="$idToken"; fi
+
+                terraform -chdir=30-nginx init -input=false \
+                  -backend-config="resource_group_name=$(stateResourceGroup)" \
+                  -backend-config="storage_account_name=$(stateStorageAccount)" \
+                  -backend-config="container_name=$(stateContainer)" \
+                  -backend-config="key=30-nginx.tfstate"
+
+                terraform -chdir=30-nginx apply -auto-approve -input=false \
+                  -var="state_resource_group_name=$(stateResourceGroup)" \
+                  -var="state_storage_account_name=$(stateStorageAccount)" \
+                  -var="state_container_name=$(stateContainer)"
+
+                WEBSITE_URL="$(terraform -chdir=30-nginx output -raw website_url)"
+                echo "Website URL: ${WEBSITE_URL}"
+                echo "##vso[task.setvariable variable=websiteUrl;isOutput=true]${WEBSITE_URL}"
